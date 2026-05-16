@@ -19,6 +19,30 @@ HELP_TEXT = (
     "例如：-30 珍珠奶茶"
 )
 
+if NOTION_TOKEN and NOTION_DB_ID:
+    try:
+        requests.patch(
+            f'https://api.notion.com/v1/databases/{NOTION_DB_ID}',
+            headers={
+                'Authorization': f'Bearer {NOTION_TOKEN}',
+                'Content-Type': 'application/json',
+                'Notion-Version': '2022-06-28'
+            },
+            json={'properties': {'記錄人': {'rich_text': {}}}}
+        )
+    except Exception:
+        pass
+
+
+def get_line_name(user_id):
+    resp = requests.get(
+        f'https://api.line.me/v2/bot/profile/{user_id}',
+        headers={'Authorization': f'Bearer {LINE_TOKEN}'}
+    )
+    if resp.ok:
+        return resp.json().get('displayName', '')
+    return ''
+
 
 def line_reply(reply_token, text):
     requests.post(
@@ -28,7 +52,15 @@ def line_reply(reply_token, text):
     )
 
 
-def notion_create(name, date, record_type, amount):
+def notion_create(name, date, record_type, amount, recorder=''):
+    props = {
+        '名稱': {'title': [{'text': {'content': name}}]},
+        '日期': {'date': {'start': date}},
+        '類型': {'select': {'name': record_type}},
+        '金額': {'number': amount}
+    }
+    if recorder:
+        props['記錄人'] = {'rich_text': [{'text': {'content': recorder}}]}
     resp = requests.post(
         'https://api.notion.com/v1/pages',
         headers={
@@ -38,12 +70,7 @@ def notion_create(name, date, record_type, amount):
         },
         json={
             'parent': {'database_id': NOTION_DB_ID},
-            'properties': {
-                '名稱': {'title': [{'text': {'content': name}}]},
-                '日期': {'date': {'start': date}},
-                '類型': {'select': {'name': record_type}},
-                '金額': {'number': amount}
-            }
+            'properties': props
         }
     )
     return resp.ok
@@ -92,14 +119,17 @@ def webhook():
             continue
         text = event['message']['text'].strip()
         reply_token = event['replyToken']
-        today = datetime.now().strftime('%Y-%m-%d')
+        today = datetime.now().strftime('%Y-%m-%dT%H:%M:%S+08:00')
+
+        user_id = event.get('source', {}).get('userId', '')
+        recorder = get_line_name(user_id) if user_id else ''
 
         if text.startswith('+'):
             parts = text[1:].strip().split(None, 1)
             try:
                 amount = int(parts[0])
                 note = parts[1] if len(parts) > 1 else '收入'
-                if notion_create(note, today, '收入', amount):
+                if notion_create(note, today, '收入', amount, recorder):
                     line_reply(reply_token, f'✅ 收入 +{amount} 元已記錄！')
                 else:
                     line_reply(reply_token, '❌ 記錄失敗，請再試一次')
@@ -111,7 +141,7 @@ def webhook():
             try:
                 amount = int(parts[0])
                 note = parts[1] if len(parts) > 1 else '支出'
-                if notion_create(note, today, '支出', amount):
+                if notion_create(note, today, '支出', amount, recorder):
                     line_reply(reply_token, f'💸 支出 -{amount} 元已記錄！')
                 else:
                     line_reply(reply_token, '❌ 記錄失敗，請再試一次')
