@@ -1,7 +1,6 @@
 from flask import Flask, request, jsonify
 import requests
 import os
-import re
 from datetime import datetime
 
 app = Flask(__name__)
@@ -9,7 +8,6 @@ app = Flask(__name__)
 LINE_TOKEN = os.environ.get('LINE_TOKEN')
 NOTION_TOKEN = os.environ.get('NOTION_TOKEN')
 NOTION_DB_ID = os.environ.get('NOTION_DB_ID', '11863dee-85c2-485d-9ff4-9b77be2dbb33')
-NOTION_POINTS_DB_ID = os.environ.get('NOTION_POINTS_DB_ID', '522004b3aa344e69a236bf6149a16e9b')
 
 HELP_TEXT = (
     "📒 記帳指令：\n"
@@ -17,21 +15,23 @@ HELP_TEXT = (
     "-金額 說明 → 記支出\n"
     "餘額 → 查現在有多少\n"
     "本月 → 看這個月花多少\n\n"
-    "⭐ 點數指令：\n"
-    "+N點 說明 → 獎勵點數\n"
-    "-N點 說明 → 扣除點數\n"
-    "點數 → 查目前點數\n\n"
     "例如：+100 零用錢\n"
-    "例如：-30 珍珠奶茶\n"
-    "例如：+5點 做家事\n"
-    "例如：-3點 忘記寫功課"
+    "例如：-30 珍珠奶茶"
 )
 
-NOTION_HEADERS = {
-    'Authorization': f'Bearer {NOTION_TOKEN}',
-    'Content-Type': 'application/json',
-    'Notion-Version': '2022-06-28'
-}
+if NOTION_TOKEN and NOTION_DB_ID:
+    try:
+        requests.patch(
+            f'https://api.notion.com/v1/databases/{NOTION_DB_ID}',
+            headers={
+                'Authorization': f'Bearer {NOTION_TOKEN}',
+                'Content-Type': 'application/json',
+                'Notion-Version': '2022-06-28'
+            },
+            json={'properties': {'記錄人': {'rich_text': {}}}}
+        )
+    except Exception:
+        pass
 
 
 def get_line_name(user_id):
@@ -63,17 +63,35 @@ def notion_create(name, date, record_type, amount, recorder=''):
         props['記錄人'] = {'rich_text': [{'text': {'content': recorder}}]}
     resp = requests.post(
         'https://api.notion.com/v1/pages',
-        headers=NOTION_HEADERS,
-        json={'parent': {'database_id': NOTION_DB_ID}, 'properties': props}
+        headers={
+            'Authorization': f'Bearer {NOTION_TOKEN}',
+            'Content-Type': 'application/json',
+            'Notion-Version': '2022-06-28'
+        },
+        json={
+            'parent': {'database_id': NOTION_DB_ID},
+            'properties': props
+        }
     )
     return resp.ok
 
 
 def notion_sum(record_type, start_date=None):
+    headers = {
+        'Authorization': f'Bearer {NOTION_TOKEN}',
+        'Content-Type': 'application/json',
+        'Notion-Version': '2022-06-28'
+    }
     base_filter = {'property': '類型', 'select': {'equals': record_type}}
-    query_filter = {
-        'and': [base_filter, {'property': '日期', 'date': {'on_or_after': start_date}}]
-    } if start_date else base_filter
+    if start_date:
+        query_filter = {
+            'and': [
+                base_filter,
+                {'property': '日期', 'date': {'on_or_after': start_date}}
+            ]
+        }
+    else:
+        query_filter = base_filter
 
     total = 0
     cursor = None
@@ -83,47 +101,10 @@ def notion_sum(record_type, start_date=None):
             body['start_cursor'] = cursor
         result = requests.post(
             f'https://api.notion.com/v1/databases/{NOTION_DB_ID}/query',
-            headers=NOTION_HEADERS, json=body
+            headers=headers, json=body
         ).json()
         for page in result.get('results', []):
             total += page['properties']['金額']['number'] or 0
-        if not result.get('has_more'):
-            break
-        cursor = result.get('next_cursor')
-    return total
-
-
-def points_create(name, date, record_type, points, recorder=''):
-    props = {
-        '名稱': {'title': [{'text': {'content': name}}]},
-        '日期': {'date': {'start': date}},
-        '類型': {'select': {'name': record_type}},
-        '點數': {'number': points}
-    }
-    if recorder:
-        props['記錄人'] = {'rich_text': [{'text': {'content': recorder}}]}
-    resp = requests.post(
-        'https://api.notion.com/v1/pages',
-        headers=NOTION_HEADERS,
-        json={'parent': {'database_id': NOTION_POINTS_DB_ID}, 'properties': props}
-    )
-    return resp.ok
-
-
-def points_sum(record_type):
-    total = 0
-    cursor = None
-    query_filter = {'property': '類型', 'select': {'equals': record_type}}
-    while True:
-        body = {'filter': query_filter, 'page_size': 100}
-        if cursor:
-            body['start_cursor'] = cursor
-        result = requests.post(
-            f'https://api.notion.com/v1/databases/{NOTION_POINTS_DB_ID}/query',
-            headers=NOTION_HEADERS, json=body
-        ).json()
-        for page in result.get('results', []):
-            total += page['properties']['點數']['number'] or 0
         if not result.get('has_more'):
             break
         cursor = result.get('next_cursor')
@@ -138,46 +119,17 @@ def webhook():
             continue
         text = event['message']['text'].strip()
         reply_token = event['replyToken']
-        now = datetime.now()
-        timestamp = now.strftime('%Y-%m-%dT%H:%M:%S+08:00')
+        today = datetime.now().strftime('%Y-%m-%dT%H:%M:%S+08:00')
 
         user_id = event.get('source', {}).get('userId', '')
         recorder = get_line_name(user_id) if user_id else ''
 
-        m_reward = re.match(r'^\+(\d+)點\s*(.*)$', text)
-        m_deduct = re.match(r'^-(\d+)點\s*(.*)$', text)
-
-        if m_reward:
-            pts = int(m_reward.group(1))
-            note = m_reward.group(2).strip() or '獎勵'
-            if points_create(note, timestamp, '獎勵', pts, recorder):
-                line_reply(reply_token, f'⭐ 獎勵 +{pts} 點已記錄！\n原因：{note}')
-            else:
-                line_reply(reply_token, '❌ 記錄失敗，請再試一次')
-
-        elif m_deduct:
-            pts = int(m_deduct.group(1))
-            note = m_deduct.group(2).strip() or '扣點'
-            if points_create(note, timestamp, '扣點', pts, recorder):
-                line_reply(reply_token, f'😔 扣除 -{pts} 點已記錄。\n原因：{note}')
-            else:
-                line_reply(reply_token, '❌ 記錄失敗，請再試一次')
-
-        elif text == '點數':
-            earned = points_sum('獎勵')
-            deducted = points_sum('扣點')
-            line_reply(reply_token,
-                f'⭐ 目前點數：{earned - deducted} 點\n'
-                f'累計獲得：{earned} 點\n'
-                f'累計扣除：{deducted} 點'
-            )
-
-        elif text.startswith('+'):
+        if text.startswith('+'):
             parts = text[1:].strip().split(None, 1)
             try:
                 amount = int(parts[0])
                 note = parts[1] if len(parts) > 1 else '收入'
-                if notion_create(note, timestamp, '收入', amount, recorder):
+                if notion_create(note, today, '收入', amount, recorder):
                     line_reply(reply_token, f'✅ 收入 +{amount} 元已記錄！')
                 else:
                     line_reply(reply_token, '❌ 記錄失敗，請再試一次')
@@ -189,7 +141,7 @@ def webhook():
             try:
                 amount = int(parts[0])
                 note = parts[1] if len(parts) > 1 else '支出'
-                if notion_create(note, timestamp, '支出', amount, recorder):
+                if notion_create(note, today, '支出', amount, recorder):
                     line_reply(reply_token, f'💸 支出 -{amount} 元已記錄！')
                 else:
                     line_reply(reply_token, '❌ 記錄失敗，請再試一次')
@@ -206,6 +158,7 @@ def webhook():
             )
 
         elif text == '本月':
+            now = datetime.now()
             first_day = f'{now.year}-{now.month:02d}-01'
             income = notion_sum('收入', first_day)
             expense = notion_sum('支出', first_day)
